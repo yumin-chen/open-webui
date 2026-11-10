@@ -1,0 +1,54 @@
+# compose.yml — Open WebUI via Apple Container (container-compose), talking to
+# your NATIVE, Metal-accelerated Ollama.
+#
+# WHY THIS SHAPE
+#  - Ollama is installed natively (brew) and runs with Metal GPU. We keep it
+#    native and let the WebUI container reach it across the Apple Container
+#    bridge, instead of shipping a second, GPU-less Ollama inside a Linux VM.
+#  - Apple Container does NOT provide `host.containers.internal` and does NOT
+#    support `--add-host` / `extra_hosts`. From inside a container the host is
+#    reachable at the VM's default gateway IP. For this VM that is 192.168.66.1.
+#    Re-check anytime with:   container run alpine:latest ip route
+#    (read the "default via <IP>" line) and update OLLAMA_BASE_URL if it moved.
+#  - Native Ollama must listen on 0.0.0.0 (not just loopback) so the bridge can
+#    reach it. Set for this session with:
+#        launchctl setenv OLLAMA_HOST 0.0.0.0:11434
+#        brew services restart ollama
+#    (launchctl setenv is per-session and will NOT survive a reboot — see the
+#     durable fix at the bottom of this file.)
+#
+# container-compose QUIRKS handled here:
+#  - Named volumes with a subpath (vol:/app/backend/data) get mounted at the
+#    PARENT dir (/app/backend/), shadowing the app code. So we use an explicit
+#    bind mount for the subpath instead.
+#  - `environment` must be a mapping, not a `- KEY=value` list.
+#
+# LAUNCH
+#   cd ~/Workspaces/open-web-ui
+#   container-compose up -d
+#   open http://localhost:3000   (first run creates an admin account)
+
+services:
+  open-webui:
+    image: ghcr.io/open-webui/open-webui:main
+    container_name: open-webui
+    ports:
+      - "3000:8080"            # host : container (image listens on 8080)
+    environment:
+      # Host gateway the container uses to reach native Ollama.
+      OLLAMA_BASE_URL: http://192.168.66.1:11434
+    volumes:
+      # Bind mount (NOT a named volume): container-compose mishandles named
+      # volume subpaths, mounting at /app/backend/ and hiding the app code.
+      - ~/.containers/Volumes/open-web-ui/open-webui-data:/app/backend/data
+
+# --- DURABLE 0.0.0.0 BIND FOR NATIVE OLLAMA (optional, survives reboot) ------
+# Homebrew regenerates ~/Library/LaunchAgents/sh.brew.ollama.plist from the
+# formula on every `brew services restart`, wiping manual edits. To make the
+# 0.0.0.0 bind persist across reboots:
+#   1. Edit that plist: add inside the <dict> of EnvironmentVariables:
+#        <key>OLLAMA_HOST</key><string>0.0.0.0:11434</string>
+#   2. Load it WITHOUT brew (so it isn't overwritten):
+#        launchctl unload ~/Library/LaunchAgents/sh.brew.ollama.plist
+#        launchctl load   ~/Library/LaunchAgents/sh.brew.ollama.plist
+# ---------------------------------------------------------------------------
