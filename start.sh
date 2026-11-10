@@ -1,53 +1,83 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Launch Open WebUI against the native, Metal-accelerated Ollama, auto-detecting
-# the host-gateway IP the Apple Container VM uses to reach the Mac.
+# Launch Open WebUI (Apple Container) against the native, Metal-accelerated
+# Ollama, passing OLLAMA_BASE_URL as a REAL environment variable.
 #
-# WHY: Apple Container provides no `host.docker.internal`, no `--add-host`, and
-# no ${VAR} interpolation in compose files. The gateway IP that containers use
-# to reach the host is NOT static (it can change if the VM is recreated), so we
-# detect it at runtime and substitute it into compose.yml before launching.
+# WHY THIS (not container-compose):
+#   Apple's container-compose (verified through 1.2.0) does NOT interpolate
+#   ${VAR} in compose files, and its -e / --env-file flags do NOT pass the value
+#   into the container. The raw `container` CLI DOES support `-e KEY` (inherits
+#   the host's env value) and `-e KEY=value`. So we launch with the raw CLI and
+#   inject the host-gateway IP via `-e OLLAMA_BASE_URL` — no sed, no placeholder,
+#   the repo stays clean.
 #
-# Usage:  ./start.sh          (optionally: ./start.sh down)
+# The Apple Container VM gateway (containers -> host) is the IP the WebUI uses to
+# reach Ollama. It is internal to the VM and stable across Wi-Fi/network
+# switches, but can change if the VM is recreated. So we detect it at runtime:
+#     container run alpine:latest ip route   ->  "default via <GW>"
+# Fallback: the Mac's LAN IP. Reachable only because Ollama binds 0.0.0.0:11434
+# (baked into ~/Library/LaunchAgents/sh.brew.ollama.plist; survives reboots).
+#
+# Usage:
+#   ./start.sh          # start (default)
+#   ./start.sh up       # start
+#   ./start.sh down     # stop + remove container
+#   ./start.sh restart  # down + up
+#   ./start.sh logs     # tail logs
+#   ./start.sh status   # health + container state
 
 cd "$(dirname "$0")"
 
-CMD="${1:-up}"
+IMAGE="ghcr.io/open-webui/open-webui:main"
+NAME="open-webui"
+HOST_PORT=3000
+CT_PORT=8080
+DATA_VOL="${HOME}/.containers/Volumes/open-web-ui/open-webui-data:/app/backend/data"
 
-# 1. Detect the Apple Container host gateway. Most stable across Wi-Fi / network
-#    switches because it is internal to the VM. Fallback to the Mac's LAN IP.
-GW="$(container run --rm alpine:latest ip route 2>/dev/null | awk '/default/{print $3}')"
-if [ -z "$GW" ]; then
-  GW="$(ipconfig getifaddr en0 2>/dev/null || ipconfig getifaddr en1 2>/dev/null)"
-fi
-if [ -z "$GW" ]; then
-  echo "ERROR: could not detect a host IP for Ollama (need Apple Container running + alpine image)." >&2
-  exit 1
-fi
-echo "Resolved Ollama host IP: $GW"
+detect_gw() {
+  local gw
+  gw="$(container run --rm alpine:latest ip route 2>/dev/null | awk '/default/{print $3}')"
+  if [ -z "$gw" ]; then
+    gw="$(ipconfig getifaddr en0 2>/dev/null || ipconfig getifaddr en1 2>/dev/null)"
+  fi
+  if [ -z "$gw" ]; then
+    echo "ERROR: could not detect a host IP for Ollama (need Apple Container running + alpine image)." >&2
+    exit 1
+  fi
+  echo "$gw"
+}
 
-PLACEHOLDER="__OLLAMA_HOST_IP__"
+up() {
+  local gw="$1"
+  # Export so `container run -e OLLAMA_BASE_URL` inherits it (no value on the flag).
+  export OLLAMA_BASE_URL="http://${gw}:11434"
+  echo "Resolved Ollama host IP: $gw  ->  OLLAMA_BASE_URL=$OLLAMA_BASE_URL"
+  container rm -f "$NAME" 2>/dev/null || true
+  container run -d --name "$NAME" -p "${HOST_PORT}:${CT_PORT}" \
+    -v "$DATA_VOL" \
+    -e OLLAMA_BASE_URL \
+    "$IMAGE"
+  echo "Started $NAME. Waiting for first-run migration..."
+  local i
+  for i in $(seq 1 30); do
+    if curl -s -o /dev/null --max-time 3 "http://localhost:${HOST_PORT}/health"; then
+      echo "WebUI healthy after ~${i}s -> http://localhost:${HOST_PORT}"
+      return 0
+    fi
+    sleep 1
+  done
+  echo "WARN: health not ready yet; check: container logs $NAME"
+}
 
-# 2. If stopping, just delegate (no substitution needed).
-if [ "$CMD" != "up" ]; then
-  container-compose "$CMD"
-  exit 0
-fi
-
-# 3. Substitute the placeholder in the OLLAMA_BASE_URL value line only, launch,
-#    then restore compose.yml so git stays clean. The running container already
-#    captured the value at creation time, so restoring afterward is safe.
-if ! grep -q "$PLACEHOLDER" compose.yml; then
-  echo "NOTE: compose.yml has no $PLACEHOLDER — launching as-is." >&2
-  container-compose up -d
-  exit 0
-fi
-
-cp compose.yml /tmp/compose.yml.bak."$$"
-# Anchor the substitution to the OLLAMA_BASE_URL value line only.
-sed -i '' "s|^\( *OLLAMA_BASE_URL: *http://\)$PLACEHOLDER|\1$GW|" compose.yml
-# up may report a benign "timed out waiting" while the container starts async.
-container-compose up -d || true
-mv /tmp/compose.yml.bak."$$" compose.yml
-echo "compose.yml restored (placeholder intact); running container uses $GW."
+case "${1:-up}" in
+  up)      up "$(detect_gw)" ;;
+  down)    container rm -f "$NAME" 2>/dev/null && echo "Stopped $NAME" || echo "$NAME not running" ;;
+  restart) container rm -f "$NAME" 2>/dev/null || true; up "$(detect_gw)" ;;
+  logs)    container logs "$NAME" ;;
+  status)
+    curl -s -o /dev/null -w "localhost:${HOST_PORT} -> HTTP %{http_code}\n" --max-time 5 "http://localhost:${HOST_PORT}/health" || echo "not reachable"
+    container list 2>&1 | grep -E "$NAME|ID" || true
+    ;;
+  *) echo "Usage: $0 [up|down|restart|logs|status]" >&2; exit 1 ;;
+esac

@@ -1,5 +1,22 @@
-# compose.yml — Open WebUI via Apple Container (container-compose), talking to
-# your NATIVE, Metal-accelerated Ollama.
+# compose.yml — Open WebUI deployment SPEC (Apple Container), talking to your
+# NATIVE, Metal-accelerated Ollama.
+#
+# This file is the DECLARATIVE REFERENCE for the deployed shape (image, ports,
+# data volume). The actual launcher is ./start.sh, which uses the raw `container`
+# CLI (NOT container-compose) — see why below.
+#
+# WHY NOT container-compose?
+#   Apple's container-compose (verified through 1.2.0) does NOT interpolate
+#   ${VAR} in compose files, and its -e / --env-file flags do NOT pass the value
+#   into the container. The raw `container` CLI DOES support `-e KEY` (inherits
+#   the host's env value) and `-e KEY=value`. So ./start.sh detects the live
+#   host-gateway IP and launches with:
+#       container run -d --name open-webui -p 3000:8080 \
+#         -v ~/.containers/Volumes/open-web-ui/open-webui-data:/app/backend/data \
+#         -e OLLAMA_BASE_URL \
+#         ghcr.io/open-webui/open-webui:main
+#   (OLLAMA_BASE_URL is exported by start.sh before launch — no sed, no
+#   placeholder, the repo stays clean.)
 #
 # WHY THIS SHAPE
 #  - Ollama is installed natively (brew) and runs with Metal GPU. We keep it
@@ -8,9 +25,8 @@
 #  - Apple Container does NOT provide `host.containers.internal` and does NOT
 #    support `--add-host` / `extra_hosts`. From inside a container the host is
 #    reachable at the VM's default gateway IP — which is NOT static (it can
-#    change if the Apple Container VM is recreated). So we do NOT hardcode it:
-#    ./start.sh detects the live gateway and substitutes it into this file
-#    before launching. Re-check anytime with:   container run alpine:latest ip route
+#    change if the Apple Container VM is recreated). So ./start.sh detects it at
+#    runtime. Re-check anytime with:   container run alpine:latest ip route
 #    (read the "default via <IP>" line).
 #  - Native Ollama listens on 0.0.0.0 (not just loopback) so the bridge can
 #    reach it. This is now baked into the LaunchAgent plist
@@ -18,14 +34,7 @@
 #    OLLAMA_HOST=0.0.0.0:11434) and survives reboots. See the note at the
 #    bottom of this file about the one `brew services` gotcha.
 #
-# container-compose QUIRKS handled here:
-#  - Named volumes with a subpath (vol:/app/backend/data) get mounted at the
-#    PARENT dir (/app/backend/), shadowing the app code. So we use an explicit
-#    bind mount for the subpath instead.
-#  - `environment` must be a mapping, not a `- KEY=value` list.
-#  - No ${VAR} interpolation, so the gateway IP is injected by ./start.sh.
-#
-# LAUNCH  (use start.sh — it auto-detects the gateway IP; do not hardcode)
+# LAUNCH
 #   cd ~/Workspaces/open-web-ui
 #   ./start.sh
 #   open http://localhost:3000   (first run creates an admin account)
@@ -36,11 +45,6 @@ services:
     container_name: open-webui
     ports:
       - "3000:8080"            # host : container (image listens on 8080)
-    environment:
-      # Gateway IP is injected at launch by ./start.sh. The placeholder token
-      # in the value line below is replaced with the live Apple Container host
-      # gateway (no host.docker.internal / ${VAR} interpolation available).
-      OLLAMA_BASE_URL: http://__OLLAMA_HOST_IP__:11434
     volumes:
       # Bind mount (NOT a named volume): container-compose mishandles named
       # volume subpaths, mounting at /app/backend/ and hiding the app code.
