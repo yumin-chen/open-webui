@@ -7,9 +7,11 @@
 #    bridge, instead of shipping a second, GPU-less Ollama inside a Linux VM.
 #  - Apple Container does NOT provide `host.containers.internal` and does NOT
 #    support `--add-host` / `extra_hosts`. From inside a container the host is
-#    reachable at the VM's default gateway IP. For this VM that is 192.168.66.1.
-#    Re-check anytime with:   container run alpine:latest ip route
-#    (read the "default via <IP>" line) and update OLLAMA_BASE_URL if it moved.
+#    reachable at the VM's default gateway IP — which is NOT static (it can
+#    change if the Apple Container VM is recreated). So we do NOT hardcode it:
+#    ./start.sh detects the live gateway and substitutes it into this file
+#    before launching. Re-check anytime with:   container run alpine:latest ip route
+#    (read the "default via <IP>" line).
 #  - Native Ollama must listen on 0.0.0.0 (not just loopback) so the bridge can
 #    reach it. Set for this session with:
 #        launchctl setenv OLLAMA_HOST 0.0.0.0:11434
@@ -22,10 +24,11 @@
 #    PARENT dir (/app/backend/), shadowing the app code. So we use an explicit
 #    bind mount for the subpath instead.
 #  - `environment` must be a mapping, not a `- KEY=value` list.
+#  - No ${VAR} interpolation, so the gateway IP is injected by ./start.sh.
 #
-# LAUNCH
+# LAUNCH  (use start.sh — it auto-detects the gateway IP; do not hardcode)
 #   cd ~/Workspaces/open-web-ui
-#   container-compose up -d
+#   ./start.sh
 #   open http://localhost:3000   (first run creates an admin account)
 
 services:
@@ -35,8 +38,10 @@ services:
     ports:
       - "3000:8080"            # host : container (image listens on 8080)
     environment:
-      # Host gateway the container uses to reach native Ollama.
-      OLLAMA_BASE_URL: http://192.168.66.1:11434
+      # Gateway IP is injected at launch by ./start.sh. The placeholder token
+      # in the value line below is replaced with the live Apple Container host
+      # gateway (no host.docker.internal / ${VAR} interpolation available).
+      OLLAMA_BASE_URL: http://__OLLAMA_HOST_IP__:11434
     volumes:
       # Bind mount (NOT a named volume): container-compose mishandles named
       # volume subpaths, mounting at /app/backend/ and hiding the app code.
